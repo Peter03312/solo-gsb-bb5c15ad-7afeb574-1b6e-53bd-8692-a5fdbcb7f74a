@@ -218,3 +218,45 @@ Content-Type: application/json
   "target_volume_ul": 10,
   "target_concentration_ng_ul": 0
 }
+
+### 28. 批量运输风险比较（只读）：再准备一个干净样本与一个空状态样本
+POST {{baseUrl}}/samples
+Content-Type: application/json
+
+{"id": "sample-risk-clean", "name": "运输风险-干净样本", "freeze_threshold_c": -20, "thaw_threshold_c": 0, "min_allowed_c": -80, "max_allowed_c": 8, "max_freeze_thaw_cycles": 5, "max_integration_interval_minutes": 120}
+
+###
+POST {{baseUrl}}/samples
+Content-Type: application/json
+
+{"id": "sample-risk-empty", "name": "运输风险-无读数样本", "freeze_threshold_c": -20, "thaw_threshold_c": 0, "min_allowed_c": -80, "max_allowed_c": 8, "max_freeze_thaw_cycles": 5, "max_integration_interval_minutes": 120}
+
+### 29. 比较本批样本当前运输风险：五项批内最小-最大归一化、加权总分、非支配前沿、排名
+POST {{baseUrl}}/transport-risk
+Content-Type: application/json
+
+{
+  "sample_ids": ["sample-demo-001", "sample-risk-clean", "sample-risk-empty"],
+  "weights": {
+    "cycle_count": 2,
+    "cold_dose_c_min": 1,
+    "heat_dose_c_min": 1,
+    "exposure_gap_minutes": 1,
+    "unacknowledged_alert_count": 3
+  }
+}
+
+### 30. 非法请求：样本 ID 重复 / 数量越界 / 权重全零或负值 / 样本不存在 -> 422
+POST {{baseUrl}}/transport-risk
+Content-Type: application/json
+
+{
+  "sample_ids": ["sample-risk-empty", "sample-risk-empty"],
+  "weights": {
+    "cycle_count": 1,
+    "cold_dose_c_min": 1,
+    "heat_dose_c_min": 1,
+    "exposure_gap_minutes": 1,
+    "unacknowledged_alert_count": 0
+  }
+}

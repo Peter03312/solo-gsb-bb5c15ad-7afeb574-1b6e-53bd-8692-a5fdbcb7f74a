@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 端到端示例：创建样本 -> 正常冻融 -> 迟到数据重排 -> 幂等去重 -> 越限/超限告警
 #           -> 暴露剂量预算告警 -> 查询
+#           -> 批量运输风险比较（只读，批内归一化 + 加权总分 + 非支配前沿）
 # 用法: ./examples/demo.sh （需先在 localhost:8000 启动服务）
 set -euo pipefail
 
@@ -114,3 +115,26 @@ curl -sS "$BASE/samples/$SID/custody-handovers"; echo
 
 echo "== 告警归责查询（当前告警按事件时间匹配左闭右开责任区间）=="
 curl -sS "$BASE/samples/$SID/alert-custody"; echo
+
+echo "== 批量运输风险比较（只读）：再建一个无读数样本与本批样本比较 =="
+curl -sS -X POST "$BASE/samples" -H 'Content-Type: application/json' -d "{
+  \"id\": \"sample-demo-002\",
+  \"name\": \"未启用样本（五项指标全 0）\",
+  \"freeze_threshold_c\": -20,
+  \"thaw_threshold_c\": 0,
+  \"min_allowed_c\": -80,
+  \"max_allowed_c\": 8,
+  \"max_freeze_thaw_cycles\": 5
+}"; echo
+
+echo "== 风险比较：循环数权重 2、未确认告警权重 3、其余各 1（批内归一化 + 加权总分 + 前沿 + 排名）=="
+curl -sS -X POST "$BASE/transport-risk" -H 'Content-Type: application/json' -d "{
+  \"sample_ids\": [\"$SID\", \"sample-demo-002\"],
+  \"weights\": {
+    \"cycle_count\": 2,
+    \"cold_dose_c_min\": 1,
+    \"heat_dose_c_min\": 1,
+    \"exposure_gap_minutes\": 1,
+    \"unacknowledged_alert_count\": 3
+  }
+}"; echo

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import sqlite3
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from fastapi.responses import RedirectResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from . import __version__, services
 from .database import init_db
@@ -41,6 +44,8 @@ from .schemas import (
     SampleUpdate,
     SolutionPlanRequest,
     SolutionPlanResponse,
+    TransportRiskRequest,
+    TransportRiskResponse,
 )
 
 @asynccontextmanager
@@ -71,6 +76,12 @@ app = FastAPI(
         "目标体积/浓度，精确枚举满足体积与质量（浓度×体积）双等式的整数取用方案，"
         "按使用来源样本数最少、取用体积向量字典序最小择优；只读不扣减库存，"
         "无精确解返回 409，样本不存在、重复 ID 或参数非法返回 422。"
+        "另提供只读批量运输风险比较：给定 2～50 个已存在样本 ID 与五项指标的"
+        "有限非负权重（至少一项为正），从各样本当前重算状态读取冻融循环数、"
+        "低温/高温剂量、暴露缺口分钟数、未确认告警数，在批内逐项最小-最大归一化"
+        "（全相同记 0），加权和除以权重和得到总分，并基于原始指标求非支配前沿；"
+        "返回原始指标、归一化值、总分、前沿标记及按总分/样本 ID 排序的排名，"
+        "纯只读，不改变样本状态与告警。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -89,6 +100,32 @@ def _require_logger(conn: sqlite3.Connection, logger_id: str) -> sqlite3.Row:
     if logger is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="记录仪不存在")
     return logger
+
+
+@app.exception_handler(RequestValidationError)
+def _validation_exception_handler(_request, exc: RequestValidationError):
+    """保持 FastAPI 默认 422 结构，但对回显内容做无害化：
+
+    非法权重可能是 NaN/Infinity（非标准 JSON 数值），默认校验错误响应会回显
+    原始 ``input``，二次 JSON 编码会抛 500；这里把非有限浮点替换为字符串说明，
+    既保留字段定位（loc）又保证响应始终为合法 JSON。
+    """
+
+    def _sanitize(value):
+        if isinstance(value, float) and not math.isfinite(value):
+            if math.isnan(value):
+                return "NaN"
+            return "Infinity" if value > 0 else "-Infinity"
+        if isinstance(value, dict):
+            return {k: _sanitize(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_sanitize(v) for v in value]
+        return value
+
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": jsonable_encoder([_sanitize(err) for err in exc.errors()])},
+    )
 
 
 # ---------------- 健康检查 / 文档 ----------------
@@ -690,3 +727,37 @@ def create_solution_plan(
     if result is None:
         raise HTTPException(status_code=409, detail="不存在满足目标体积与浓度的精确配液方案")
     return result
+
+
+# ---------------- 批量样本运输风险比较（只读） ----------------
+
+
+@app.post(
+    "/transport-risk",
+    response_model=TransportRiskResponse,
+    tags=["transport-risk"],
+)
+def compare_transport_risk(payload: TransportRiskRequest, conn=Depends(services.get_db_connection)):
+    """批量比较已有样本的**当前运输风险**（纯只读计算）。
+
+    给定 2～50 个已存在样本 ID 与五项指标的有限非负权重（至少一项为正）：
+
+    1. 从各样本**当前重算状态**读取五项指标：``cycle_count``（完整冻融循环数）、
+       ``cold_dose_c_min`` / ``heat_dose_c_min``（低温/高温累计剂量）、
+       ``exposure_gap_minutes``（暴露缺口分钟数）、
+       ``unacknowledged_alert_count``（未确认告警数）；
+    2. 在**本批样本内逐指标**做最小-最大归一化
+       ``(x - min) / (max - min)``；该指标全批数值全相同时归一化值统一记 0；
+    3. ``total_score = Σ 权重 × 归一化值 / 权重和``，范围 ``[0, 1]``，越小越安全；
+    4. 基于五项**原始指标**求非支配前沿：一条样本所有指标不高于另一条且至少一项
+       严格更低时支配后者，``on_frontier=true`` 表示不被批内任一样本支配；
+    5. 结果按总分升序、总分相同按样本 ID 升序排名（``rank`` 从 1 起）。
+
+    样本 ID 重复、数量越界（<2 或 >50）、权重非法（负数/非有限/全零）返回 422；
+    任一样本不存在同样返回 422。接口只读：不触发重算、不改变样本状态与告警。
+    """
+
+    try:
+        return services.compare_transport_risk(conn, payload.model_dump())
+    except services.ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))

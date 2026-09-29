@@ -31,6 +31,12 @@
   的整数取用方案，按**使用来源样本数最少 → 请求顺序取用体积向量字典序最小**择优，
   逐项返回含零用量的配方与使用样本数；纯只读计算，**不扣减库存**，
   无精确解返回 409，样本不存在 / 重复 ID / 参数非法返回 422；
+- 提供**只读批量运输风险比较**（`POST /transport-risk`）：给定 2～50 个已存在样本 ID
+  与五项指标（冻融循环数、低温/高温剂量、暴露缺口分钟数、未确认告警数）的有限非负
+  权重（至少一项为正），从各样本**当前重算状态**读取五项指标，在**本批内逐指标**
+  最小-最大归一化（数值全相同记 0），总分 = 归一化值加权和 ÷ 权重和，并基于五项
+  **原始指标**求非支配前沿；返回原始指标、归一化值、总分、前沿标记与按
+  总分升序 / 样本 ID 升序的排名；**纯只读，不触发重算、不改变样本状态与告警**；
 - 容器启动即自动初始化数据库（建表、索引），旧版本数据库自动兼容迁移。
 
 ## 目录结构
@@ -41,6 +47,7 @@ app/
   engine.py      # 纯函数冻融状态机（循环识别 + 告警推导），不依赖 Web/DB
   matching.py    # 纯函数一致性配对（不交叉一对一最优配对），不依赖 Web/DB
   solution.py    # 纯函数配液方案求解（整数精确枚举 + 字典序择优），不依赖 Web/DB
+  risk.py        # 纯函数批量运输风险比较（批内归一化 + 加权总分 + 非支配前沿），不依赖 Web/DB
   database.py    # SQLite 连接与幂等建表脚本
   schemas.py     # Pydantic 请求/响应模型
   services.py    # 业务层：幂等写入、时间重排重算、告警确认、一致性核查、配液求解
@@ -312,6 +319,7 @@ curl http://localhost:8000/samples/sample-demo-001/alert-custody
 | GET | `/alerts` | **告警查询**（可按样本、确认状态过滤，分页） |
 | GET/POST | `/alerts/{id}` `/alerts/{id}/ack` | 告警详情 / 确认（或取消确认） |
 | POST | `/samples/{id}/alerts/ack` | 批量确认样本下所有告警 |
+| POST | `/transport-risk` | **只读批量运输风险比较**：2～50 个已存在样本，批内最小-最大归一化 + 加权总分 + 原始指标非支配前沿，按总分/样本 ID 排名 |
 
 ## 示例请求（curl）
 
@@ -524,6 +532,107 @@ curl -sS -X POST http://localhost:8000/solution-plans \
   或只存在非整数解）；
 - `422`：参数非法（类型/范围/来源个数）、来源 `sample_id` 重复、或任一来源样本不存在。
 
+## 批量运输风险比较（`POST /transport-risk`，只读）
+
+实验室需要在**一批已有样本之间横向比较当前运输风险**。接口接收 2～50 个已存在
+样本 ID 与五项指标的**有限非负权重**（至少一项严格为正），从各样本**当前重算
+状态**（与 `GET /samples/{id}/state` 同源，不另起重算）读取五项“越大越危险”的指标：
+
+| 指标键 | 含义 | 来源 |
+| --- | --- | --- |
+| `cycle_count` | 完整冻融循环数 | state |
+| `cold_dose_c_min` | 低温累计暴露剂量（°C·min） | state |
+| `heat_dose_c_min` | 高温累计暴露剂量（°C·min） | state |
+| `exposure_gap_minutes` | 暴露缺口总时长（分钟） | state |
+| `unacknowledged_alert_count` | 未确认告警数 | state |
+
+计算规则：
+
+1. **批内最小-最大归一化**：对每项指标在**本批**样本内计算
+   `n = (x − min) / (max − min)`；若该指标全批数值相同（极差为 0，含全部为 0），
+   则该列归一化值**统一记 0**——无差异的指标不人为放大风险；
+2. **加权总分**：`total_score = Σ wᵢ·nᵢ / Σ wᵢ`，因权重非负且权重和为正，
+   总分范围 `[0, 1]`，越小越安全；零权重指标不参与结果；
+3. **非支配前沿**：基于五项**原始指标**判定——样本 A 五项指标全部不高于样本 B
+   且至少一项严格更低时，A 支配 B（`all aᵢ ≤ bᵢ and any aᵢ < bᵢ`）；
+   不被批内任何其他样本支配的样本 `on_frontier = true`；
+4. **排名**：结果按 `total_score` 升序、总分相同时按样本 ID 升序排列，
+   `rank` 从 1 起连续编号。
+
+请求体：
+
+```json
+{
+  "sample_ids": ["sample-demo-001", "sample-demo-002"],
+  "weights": {
+    "cycle_count": 2,
+    "cold_dose_c_min": 1,
+    "heat_dose_c_min": 1,
+    "exposure_gap_minutes": 1,
+    "unacknowledged_alert_count": 3
+  }
+}
+```
+
+响应（`items` 已按排名排序）：
+
+```json
+{
+  "sample_count": 2,
+  "weight_sum": 8.0,
+  "items": [
+    {
+      "rank": 1,
+      "sample_id": "sample-demo-001",
+      "metrics": {
+        "cycle_count": 0,
+        "cold_dose_c_min": 0.0,
+        "heat_dose_c_min": 0.0,
+        "exposure_gap_minutes": 0.0,
+        "unacknowledged_alert_count": 0
+      },
+      "normalized": {
+        "cycle_count": 0.0,
+        "cold_dose_c_min": 0.0,
+        "heat_dose_c_min": 0.0,
+        "exposure_gap_minutes": 0.0,
+        "unacknowledged_alert_count": 0.0
+      },
+      "total_score": 0.0,
+      "on_frontier": true
+    }
+  ]
+}
+```
+
+归一化值与总分保留 6 位小数；原始指标按状态原值返回（循环数/告警数为整数）。
+
+调用示例：
+
+```bash
+curl -X POST http://localhost:8000/transport-risk \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sample_ids": ["sample-a", "sample-b", "sample-c"],
+    "weights": {
+      "cycle_count": 2,
+      "cold_dose_c_min": 1,
+      "heat_dose_c_min": 1,
+      "exposure_gap_minutes": 1,
+      "unacknowledged_alert_count": 3
+    }
+  }'
+```
+
+状态码与报错（均在 `detail` 中明确说明原因）：
+
+- `200`：比较成功；
+- `422`：样本数量越界（少于 2 或多于 50）、样本 ID 重复、权重缺失/为负/非有限数
+  （NaN、Infinity）/五项全零，或**任一样本不存在**（`detail` 形如 `样本 ghost 不存在`）。
+
+本接口为**纯只读**：不触发重算、不写入任何表，不改变样本当前状态、循环、
+暴露剂量、缺口、告警及其确认状态（测试对调用前后的 state 与 alerts 做逐字节比对）。
+
 ## 测试
 
 ```bash
@@ -551,4 +660,9 @@ pytest -q
 最少来源数优先与同级向量字典序最小（含强制多来源场景）、目标零浓度与边界体积、
 无解（浓度越界/非整数解/容量不足）返回 409、样本不存在与重复 ID 返回 422、
 整数字段严格类型与取值范围校验（1～6 个来源、目标体积 1～30、浓度 0～100）、
-只读不改写任何数据，并用暴力枚举在随机小空间上交叉验证求解器择优正确性。
+只读不改写任何数据，并用暴力枚举在随机小空间上交叉验证求解器择优正确性；
+批量运输风险部分覆盖批内最小-最大归一化（全相同记 0）、加权总分除以权重和
+（零权重不参与）、非支配前沿支配定义与暴力 O(n²) 交叉验证、排名顺序
+（总分升序、同分按样本 ID 升序）、五项指标取自当前重算状态、2～50 数量边界、
+样本 ID 重复 / 样本不存在 / 权重全零 / 负值 / NaN / Infinity / 缺失字段返回 422、
+接口纯只读（调用前后 state 与告警完全不变）。

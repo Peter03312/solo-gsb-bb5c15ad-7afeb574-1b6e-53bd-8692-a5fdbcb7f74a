@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Optional
 
@@ -485,4 +486,97 @@ class SolutionPlanResponse(BaseModel):
     )
     items: list[SolutionPlanItemOut] = Field(
         ..., description="逐项配方（含零用量项，顺序与请求 sources 一致）"
+    )
+
+
+# ---------------- 批量样本运输风险比较（只读） ----------------
+
+
+class TransportRiskWeights(BaseModel):
+    """五项指标的有限非负权重；至少一项严格为正。"""
+
+    cycle_count: float = Field(
+        ..., ge=0, description="完整冻融循环数权重（非负有限数）"
+    )
+    cold_dose_c_min: float = Field(
+        ..., ge=0, description="低温累计暴露剂量权重（非负有限数）"
+    )
+    heat_dose_c_min: float = Field(
+        ..., ge=0, description="高温累计暴露剂量权重（非负有限数）"
+    )
+    exposure_gap_minutes: float = Field(
+        ..., ge=0, description="暴露缺口分钟数权重（非负有限数）"
+    )
+    unacknowledged_alert_count: float = Field(
+        ..., ge=0, description="未确认告警数权重（非负有限数）"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self):
+        values = (
+            self.cycle_count,
+            self.cold_dose_c_min,
+            self.heat_dose_c_min,
+            self.exposure_gap_minutes,
+            self.unacknowledged_alert_count,
+        )
+        # ge=0 已拦截负数；NaN/Infinity 不是合法有限权重，且全零时无法归一化
+        if any(not math.isfinite(v) for v in values):
+            raise ValueError("权重必须为有限数（不接受 NaN/Infinity）")
+        if all(v == 0 for v in values):
+            raise ValueError("五项权重至少一项必须为正数")
+        return self
+
+
+class TransportRiskRequest(BaseModel):
+    sample_ids: list[str] = Field(
+        ..., min_length=2, max_length=50, description="参与比较的样本 ID（2～50 个，不可重复）"
+    )
+    weights: TransportRiskWeights = Field(..., description="五项指标的非负权重（至少一项为正）")
+
+    @model_validator(mode="after")
+    def _validate_unique_sample_ids(self):
+        if len(self.sample_ids) != len(set(self.sample_ids)):
+            raise ValueError("样本 ID 不可重复")
+        return self
+
+
+class TransportRiskMetricsOut(BaseModel):
+    """样本当前重算状态中的五项原始指标（数值越大风险越高）。"""
+
+    cycle_count: int = Field(..., description="完整冻融循环数")
+    cold_dose_c_min: float = Field(..., description="低温累计暴露剂量（°C·min）")
+    heat_dose_c_min: float = Field(..., description="高温累计暴露剂量（°C·min）")
+    exposure_gap_minutes: float = Field(..., description="暴露缺口总时长（分钟）")
+    unacknowledged_alert_count: int = Field(..., description="未确认告警数")
+
+
+class TransportRiskNormalizedOut(BaseModel):
+    """批内最小-最大归一化值；该指标全批相同时记 0（保留 6 位小数）。"""
+
+    cycle_count: float
+    cold_dose_c_min: float
+    heat_dose_c_min: float
+    exposure_gap_minutes: float
+    unacknowledged_alert_count: float
+
+
+class TransportRiskItemOut(BaseModel):
+    rank: int = Field(..., description="名次（从 1 起；总分升序，同分按样本 ID 升序）")
+    sample_id: str
+    metrics: TransportRiskMetricsOut = Field(..., description="五项原始指标")
+    normalized: TransportRiskNormalizedOut = Field(..., description="五项批内归一化值")
+    total_score: float = Field(
+        ..., description="加权总分 = Σ 权重×归一化值 / 权重和，范围 [0, 1]（保留 6 位小数）"
+    )
+    on_frontier: bool = Field(
+        ..., description="是否位于非支配前沿（五项原始指标不被批内任一样本支配）"
+    )
+
+
+class TransportRiskResponse(BaseModel):
+    sample_count: int = Field(..., description="参与比较的样本数（2～50）")
+    weight_sum: float = Field(..., description="权重和（> 0，保留 6 位小数）")
+    items: list[TransportRiskItemOut] = Field(
+        ..., description="按排名（总分升序、样本 ID 升序）排列的比较结果"
     )

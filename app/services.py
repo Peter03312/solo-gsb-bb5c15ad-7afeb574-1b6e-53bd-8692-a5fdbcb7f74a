@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from . import engine, matching, solution
+from . import engine, matching, risk, solution
 from .database import connect
 
 # SQLite 单文件写入需要串行化；批量提交 + 重算整体持锁。
@@ -1394,6 +1394,51 @@ def plan_solution(conn: sqlite3.Connection, data: dict) -> Optional[dict]:
         "used_sample_count": sum(1 for v in volumes if v > 0),
         "total_volume_ul": sum(volumes),
         "total_mass_ng": sum(v * c for v, c in zip(volumes, (s.concentration_ng_ul for s in sources))),
+        "items": items,
+    }
+
+
+def compare_transport_risk(conn: sqlite3.Connection, data: dict) -> dict:
+    """批量样本当前运输风险比较（**纯只读**：不触发重算，不改样本状态与告警）。
+
+    五项指标均取自样本当前重算状态（与 ``GET /samples/{id}/state`` 同源）：
+    完整冻融循环数、低温/高温累计暴露剂量、暴露缺口分钟数、未确认告警数。
+    样本 ID 重复 / 个数越界 / 权重非法已由 Pydantic 拦截（422）；
+    本层只负责样本存在性校验，不存在则按 422 报错。
+    """
+
+    sample_ids: list[str] = data["sample_ids"]
+    weights = data["weights"]
+
+    samples: list[tuple[str, risk.MetricMap]] = []
+    for sample_id in sample_ids:
+        state = get_state(conn, sample_id)
+        if state is None:
+            raise ValidationError(f"样本 {sample_id} 不存在")
+        samples.append(
+            (
+                sample_id,
+                {key: state[key] for key in risk.METRIC_KEYS},
+            )
+        )
+
+    results = risk.compare_risk(samples, weights)
+    items = [
+        {
+            "rank": item["rank"],
+            "sample_id": item["sample_id"],
+            "metrics": {key: item["metrics"][key] for key in risk.METRIC_KEYS},
+            "normalized": {
+                key: round(item["normalized"][key], 6) for key in risk.METRIC_KEYS
+            },
+            "total_score": round(item["total_score"], 6),
+            "on_frontier": item["on_frontier"],
+        }
+        for item in results
+    ]
+    return {
+        "sample_count": len(sample_ids),
+        "weight_sum": round(sum(weights[key] for key in risk.METRIC_KEYS), 6),
         "items": items,
     }
 
