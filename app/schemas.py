@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Annotated, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 
 def _freeze_lt_thaw(data: dict) -> dict:
@@ -485,4 +485,95 @@ class SolutionPlanResponse(BaseModel):
     )
     items: list[SolutionPlanItemOut] = Field(
         ..., description="逐项配方（含零用量项，顺序与请求 sources 一致）"
+    )
+
+
+# ---------------- 运输风险批内比较 ----------------
+
+_SampleId = Annotated[str, StringConstraints(min_length=1, max_length=128)]
+
+
+class RiskWeightsIn(BaseModel):
+    """五项风险指标的非负权重：至少一项为正；NaN/Inf 视为非法。"""
+
+    cycle_count: float = Field(
+        ..., ge=0, allow_inf_nan=False, description="冻融循环数权重（有限非负）"
+    )
+    cold_dose_c_min: float = Field(
+        ..., ge=0, allow_inf_nan=False, description="低温暴露剂量（°C·min）权重（有限非负）"
+    )
+    heat_dose_c_min: float = Field(
+        ..., ge=0, allow_inf_nan=False, description="高温暴露剂量（°C·min）权重（有限非负）"
+    )
+    exposure_gap_minutes: float = Field(
+        ..., ge=0, allow_inf_nan=False, description="暴露缺口分钟数权重（有限非负）"
+    )
+    unacknowledged_alert_count: float = Field(
+        ..., ge=0, allow_inf_nan=False, description="未确认告警数权重（有限非负）"
+    )
+
+    @model_validator(mode="after")
+    def _validate_at_least_one_positive(self):
+        if all(v <= 0 for v in self.model_dump().values()):
+            raise ValueError("五项权重至少一项必须为正数")
+        return self
+
+
+class RiskAssessmentRequest(BaseModel):
+    sample_ids: list[_SampleId] = Field(
+        ...,
+        min_length=2,
+        max_length=50,
+        description="2～50 个已存在样本 ID（不可重复）",
+    )
+    weights: RiskWeightsIn
+
+    @model_validator(mode="after")
+    def _validate_unique_sample_ids(self):
+        if len(self.sample_ids) != len(set(self.sample_ids)):
+            raise ValueError("样本 ID 不可重复")
+        return self
+
+
+class RiskMetricsOut(BaseModel):
+    """一条样本的五项原始风险指标（取自当前重算状态，均为“越低越安全”）。"""
+
+    cycle_count: int = Field(..., description="完整冻融循环数")
+    cold_dose_c_min: float = Field(..., description="低温累计暴露剂量（°C·min）")
+    heat_dose_c_min: float = Field(..., description="高温累计暴露剂量（°C·min）")
+    exposure_gap_minutes: float = Field(..., description="暴露缺口总时长（分钟）")
+    unacknowledged_alert_count: int = Field(..., description="未确认告警数")
+
+
+class RiskNormalizedOut(BaseModel):
+    """批内最小最大归一化后的五项指标（0～1；批内数值全相同的指标记 0）。"""
+
+    cycle_count: float
+    cold_dose_c_min: float
+    heat_dose_c_min: float
+    exposure_gap_minutes: float
+    unacknowledged_alert_count: float
+
+
+class RiskAssessmentItemOut(BaseModel):
+    sample_id: str
+    rank: int = Field(
+        ..., description="名次（1 起）：总分升序、总分相同按样本 ID 升序"
+    )
+    total_score: float = Field(
+        ..., description="总分：归一化值加权和 / 权重和（0～1，越低越安全）"
+    )
+    on_frontier: bool = Field(
+        ..., description="是否处于非支配前沿（不被批内其他样本支配）"
+    )
+    metrics: RiskMetricsOut
+    normalized: RiskNormalizedOut
+
+
+class RiskAssessmentResponse(BaseModel):
+    weights: RiskWeightsIn = Field(..., description="本次评估使用的五项权重（回显）")
+    weight_sum: float = Field(..., description="权重和（总分 = 加权和 / 权重和）")
+    sample_count: int = Field(..., description="参与比较的样本数")
+    items: list[RiskAssessmentItemOut] = Field(
+        ..., description="按名次排列的逐样本评估结果（第 1 名在前）"
     )

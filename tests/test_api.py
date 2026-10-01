@@ -1770,3 +1770,256 @@ def test_solution_plan_boundary_volume_one_ul(client) -> None:
     )
     assert r.status_code == 200, r.text
     assert [it["volume_ul"] for it in r.json()["items"]] == [1, 0]
+
+
+# ---------------- 运输风险批内比较 ----------------
+
+
+def _risk_payload(sample_ids, **weights):
+    w = {
+        "cycle_count": 1,
+        "cold_dose_c_min": 1,
+        "heat_dose_c_min": 1,
+        "exposure_gap_minutes": 1,
+        "unacknowledged_alert_count": 1,
+    }
+    w.update(weights)
+    return {"sample_ids": sample_ids, "weights": w}
+
+
+def _three_risk_samples(client):
+    """构造三条指标各异的样本：
+
+    - s1：无读数 -> (循环 0, 低温 0, 高温 0, 缺口 0, 未确认告警 0)
+    - s2：1 次循环 + 高温段 240 °C·min + 1 条越限告警 -> (1, 0, 240, 0, 1)
+    - s3：2 次循环（上限 1）+ 180 分钟缺口 + 低温段 300 °C·min + 2 条告警
+      -> (2, 300, 0, 180, 2)
+    """
+
+    _create_sample(client, "s1")
+    _create_sample(client, "s2", max_integration_interval_minutes=120)
+    _submit(
+        client,
+        "s2",
+        [
+            {"event_id": "b1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": 4},
+            {"event_id": "b2", "event_time": "2026-09-20T08:30:00Z", "temperature_c": -22},
+            {"event_id": "b3", "event_time": "2026-09-20T09:30:00Z", "temperature_c": 2},
+            {"event_id": "b4", "event_time": "2026-09-20T10:30:00Z", "temperature_c": 20},
+        ],
+    )
+    _create_sample(
+        client, "s3", max_freeze_thaw_cycles=1, max_integration_interval_minutes=60
+    )
+    _submit(
+        client,
+        "s3",
+        [
+            {"event_id": "c1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": 4},
+            {"event_id": "c2", "event_time": "2026-09-20T08:30:00Z", "temperature_c": -22},
+            {"event_id": "c3", "event_time": "2026-09-20T09:00:00Z", "temperature_c": 2},
+            {"event_id": "c4", "event_time": "2026-09-20T09:30:00Z", "temperature_c": -22},
+            {"event_id": "c5", "event_time": "2026-09-20T10:00:00Z", "temperature_c": 2},
+            {"event_id": "c6", "event_time": "2026-09-20T13:00:00Z", "temperature_c": -90},
+            {"event_id": "c7", "event_time": "2026-09-20T13:30:00Z", "temperature_c": -90},
+        ],
+    )
+
+
+def test_risk_assessment_basic_scores_frontier_and_rank(client) -> None:
+    _three_risk_samples(client)
+    r = client.post("/risk-assessments", json=_risk_payload(["s1", "s2", "s3"]))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sample_count"] == 3
+    assert body["weight_sum"] == 5
+    assert body["weights"]["cycle_count"] == 1
+
+    items = body["items"]
+    assert [it["sample_id"] for it in items] == ["s1", "s2", "s3"]
+    assert [it["rank"] for it in items] == [1, 2, 3]
+    assert [it["total_score"] for it in items] == [0.0, 0.4, 0.8]
+    assert [it["on_frontier"] for it in items] == [True, False, False]
+
+    by_id = {it["sample_id"]: it for it in items}
+    # 原始指标与状态接口一致
+    for sid in ("s1", "s2", "s3"):
+        state = client.get(f"/samples/{sid}/state").json()
+        metrics = by_id[sid]["metrics"]
+        assert metrics["cycle_count"] == state["cycle_count"]
+        assert metrics["cold_dose_c_min"] == state["cold_dose_c_min"]
+        assert metrics["heat_dose_c_min"] == state["heat_dose_c_min"]
+        assert metrics["exposure_gap_minutes"] == state["exposure_gap_minutes"]
+        assert (
+            metrics["unacknowledged_alert_count"]
+            == state["unacknowledged_alert_count"]
+        )
+    # 具体数值（手工构造）：s2 = (1, 0, 240, 0, 1)，s3 = (2, 300, 0, 180, 2)
+    assert by_id["s2"]["metrics"] == {
+        "cycle_count": 1,
+        "cold_dose_c_min": 0,
+        "heat_dose_c_min": 240,
+        "exposure_gap_minutes": 0,
+        "unacknowledged_alert_count": 1,
+    }
+    assert by_id["s3"]["metrics"] == {
+        "cycle_count": 2,
+        "cold_dose_c_min": 300,
+        "heat_dose_c_min": 0,
+        "exposure_gap_minutes": 180,
+        "unacknowledged_alert_count": 2,
+    }
+    # 归一化：批内最小最大；s2 高温剂量、未确认告警居中
+    assert by_id["s2"]["normalized"] == {
+        "cycle_count": 0.5,
+        "cold_dose_c_min": 0.0,
+        "heat_dose_c_min": 1.0,
+        "exposure_gap_minutes": 0.0,
+        "unacknowledged_alert_count": 0.5,
+    }
+    assert by_id["s3"]["normalized"] == {
+        "cycle_count": 1.0,
+        "cold_dose_c_min": 1.0,
+        "heat_dose_c_min": 0.0,
+        "exposure_gap_minutes": 1.0,
+        "unacknowledged_alert_count": 1.0,
+    }
+
+
+def test_risk_assessment_weight_choice_changes_scores(client) -> None:
+    _three_risk_samples(client)
+    # 只看冻融循环数：总分 = 循环数归一化值
+    r = client.post(
+        "/risk-assessments",
+        json=_risk_payload(
+            ["s1", "s2", "s3"],
+            cycle_count=1,
+            cold_dose_c_min=0,
+            heat_dose_c_min=0,
+            exposure_gap_minutes=0,
+            unacknowledged_alert_count=0,
+        ),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["weight_sum"] == 1
+    assert [it["sample_id"] for it in body["items"]] == ["s1", "s2", "s3"]
+    assert [it["total_score"] for it in body["items"]] == [0.0, 0.5, 1.0]
+
+
+def test_risk_assessment_identical_samples_tie_broken_by_id(client) -> None:
+    # 两条空样本指标完全相同：归一化全 0、总分并列、互不支配（同在前沿），
+    # 名次按样本 ID 升序
+    _create_sample(client, "b")
+    _create_sample(client, "a")
+    r = client.post("/risk-assessments", json=_risk_payload(["b", "a"]))
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert [it["sample_id"] for it in items] == ["a", "b"]
+    assert [it["rank"] for it in items] == [1, 2]
+    assert [it["total_score"] for it in items] == [0.0, 0.0]
+    assert [it["on_frontier"] for it in items] == [True, True]
+    assert all(
+        v == 0.0 for it in items for v in it["normalized"].values()
+    )
+
+
+def test_risk_assessment_reflects_current_alert_state(client) -> None:
+    _three_risk_samples(client)
+    # 确认 s2 的唯一告警后，其未确认告警数降为 0，总分随之下降
+    ack = client.post(
+        "/samples/s2/alerts/ack", json={"acknowledged": True}
+    )
+    assert ack.status_code == 200
+    r = client.post("/risk-assessments", json=_risk_payload(["s1", "s2", "s3"]))
+    assert r.status_code == 200, r.text
+    by_id = {it["sample_id"]: it for it in r.json()["items"]}
+    assert by_id["s2"]["metrics"]["unacknowledged_alert_count"] == 0
+    # 未确认告警指标批内变为 0/0/2：s2 该项归一化 0，总分 (0.5+1)/5 = 0.3
+    assert by_id["s2"]["normalized"]["unacknowledged_alert_count"] == 0.0
+    assert by_id["s2"]["total_score"] == 0.3
+
+
+def test_risk_assessment_is_read_only(client) -> None:
+    _three_risk_samples(client)
+    states_before = {
+        sid: client.get(f"/samples/{sid}/state").json() for sid in ("s1", "s2", "s3")
+    }
+    alerts_before = client.get("/alerts").json()
+    r = client.post("/risk-assessments", json=_risk_payload(["s1", "s2", "s3"]))
+    assert r.status_code == 200, r.text
+    states_after = {
+        sid: client.get(f"/samples/{sid}/state").json() for sid in ("s1", "s2", "s3")
+    }
+    alerts_after = client.get("/alerts").json()
+    assert states_before == states_after
+    assert alerts_before == alerts_after
+
+
+def test_risk_assessment_nonexistent_sample_422(client) -> None:
+    _create_sample(client, "s1")
+    r = client.post("/risk-assessments", json=_risk_payload(["s1", "ghost"]))
+    assert r.status_code == 422
+    assert "不存在" in r.json()["detail"]
+
+
+def test_risk_assessment_duplicate_sample_id_422(client) -> None:
+    _create_sample(client, "s1")
+    r = client.post("/risk-assessments", json=_risk_payload(["s1", "s1"]))
+    assert r.status_code == 422
+
+
+def test_risk_assessment_sample_count_bounds_422(client) -> None:
+    _create_sample(client, "s1")
+    # 0 / 1 条样本
+    assert client.post("/risk-assessments", json=_risk_payload([])).status_code == 422
+    assert (
+        client.post("/risk-assessments", json=_risk_payload(["s1"])).status_code
+        == 422
+    )
+    # 51 条样本（无需存在，数量校验优先）
+    too_many = [f"bulk-{i}" for i in range(51)]
+    assert (
+        client.post("/risk-assessments", json=_risk_payload(too_many)).status_code
+        == 422
+    )
+    # 边界：恰好 50 条时通过数量校验，报样本不存在 422
+    fifty = ["s1"] + [f"bulk-{i}" for i in range(49)]
+    r = client.post("/risk-assessments", json=_risk_payload(fifty))
+    assert r.status_code == 422
+    assert "不存在" in r.json()["detail"]
+
+
+def test_risk_assessment_invalid_weights_422(client) -> None:
+    _create_sample(client, "s1")
+    _create_sample(client, "s2")
+    zero_weights = {
+        "cycle_count": 0,
+        "cold_dose_c_min": 0,
+        "heat_dose_c_min": 0,
+        "exposure_gap_minutes": 0,
+        "unacknowledged_alert_count": 0,
+    }
+    bad = [
+        _risk_payload(["s1", "s2"], cycle_count=-1),          # 负权重
+        _risk_payload(["s1", "s2"], **zero_weights),          # 全零
+        _risk_payload(["s1", "s2"], heat_dose_c_min=-0.5),    # 负权重
+        {"sample_ids": ["s1", "s2"]},                          # 缺 weights
+        {"sample_ids": ["s1", "s2"], "weights": {"cycle_count": 1}},  # 权重缺项
+    ]
+    for body in bad:
+        r = client.post("/risk-assessments", json=body)
+        assert r.status_code == 422, body
+    # NaN / Inf 非有限值（以原始 JSON 文本发送，服务端解析后由权重校验拒绝）
+    for token in ("NaN", "Infinity", "-Infinity"):
+        raw = (
+            '{"sample_ids": ["s1", "s2"], "weights": {'
+            f'"cycle_count": {token}, "cold_dose_c_min": 1, "heat_dose_c_min": 1, '
+            '"exposure_gap_minutes": 1, "unacknowledged_alert_count": 1}}'
+        )
+        r = client.post(
+            "/risk-assessments",
+            content=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 422, token

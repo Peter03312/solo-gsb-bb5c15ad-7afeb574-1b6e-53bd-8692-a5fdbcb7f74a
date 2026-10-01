@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 端到端示例：创建样本 -> 正常冻融 -> 迟到数据重排 -> 幂等去重 -> 越限/超限告警
-#           -> 暴露剂量预算告警 -> 查询
+#           -> 暴露剂量预算告警 -> 查询 -> 共享记录仪/无效时段/一致性核查
+#           -> 保管人交接与告警归责 -> 运输风险批内比较（只读）
 # 用法: ./examples/demo.sh （需先在 localhost:8000 启动服务）
 set -euo pipefail
 
@@ -114,3 +115,30 @@ curl -sS "$BASE/samples/$SID/custody-handovers"; echo
 
 echo "== 告警归责查询（当前告警按事件时间匹配左闭右开责任区间）=="
 curl -sS "$BASE/samples/$SID/alert-custody"; echo
+
+echo "== 运输风险批内比较（只读）：再建一条样本，比较两条样本的当前风险 =="
+curl -sS -X POST "$BASE/samples" -H 'Content-Type: application/json' -d '{
+  "id": "sample-demo-002",
+  "name": "单克隆抗体 批次 B-2026-09",
+  "freeze_threshold_c": -20,
+  "thaw_threshold_c": 0,
+  "min_allowed_c": -80,
+  "max_allowed_c": 8,
+  "max_freeze_thaw_cycles": 4
+}'; echo
+curl -sS -X POST "$BASE/samples/sample-demo-002/readings" -H 'Content-Type: application/json' -d '{
+  "readings": [
+    {"event_id": "d2-1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": 4.0},
+    {"event_id": "d2-2", "event_time": "2026-09-20T09:00:00Z", "temperature_c": 5.0}
+  ]
+}'; echo
+curl -sS -X POST "$BASE/risk-assessments" -H 'Content-Type: application/json' -d '{
+  "sample_ids": ["sample-demo-001", "sample-demo-002"],
+  "weights": {
+    "cycle_count": 1,
+    "cold_dose_c_min": 1,
+    "heat_dose_c_min": 2,
+    "exposure_gap_minutes": 0.5,
+    "unacknowledged_alert_count": 3
+  }
+}'; echo

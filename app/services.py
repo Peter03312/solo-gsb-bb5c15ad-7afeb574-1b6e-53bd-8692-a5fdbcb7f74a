@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from . import engine, matching, solution
+from . import engine, matching, risk, solution
 from .database import connect
 
 # SQLite 单文件写入需要串行化；批量提交 + 重算整体持锁。
@@ -1395,6 +1395,59 @@ def plan_solution(conn: sqlite3.Connection, data: dict) -> Optional[dict]:
         "total_volume_ul": sum(volumes),
         "total_mass_ng": sum(v * c for v, c in zip(volumes, (s.concentration_ng_ul for s in sources))),
         "items": items,
+    }
+
+
+# ---------------- 运输风险批内比较 ----------------
+
+
+def assess_risk(conn: sqlite3.Connection, data: dict) -> dict:
+    """只读比较一批已有样本的当前运输风险：批内归一化加权评分 + 非支配前沿。
+
+    五项指标（冻融循环数、低温/高温暴露剂量、暴露缺口分钟数、未确认告警数）
+    取自各样本**当前重算状态**（状态缓存列 + 当前未确认告警计数，与状态接口一致）；
+    本函数不触发重算，不修改任何样本状态、读数或告警。
+    样本不存在抛 ``ValidationError``（路由层映射为 422）；
+    数量越界 / ID 重复 / 权重非法由 Pydantic 拦截。
+    """
+
+    sample_ids = data["sample_ids"]
+    for sample_id in sample_ids:
+        if get_sample(conn, sample_id) is None:
+            raise ValidationError(f"样本 {sample_id} 不存在")
+
+    metrics: list[risk.RiskMetrics] = []
+    raw_metrics: dict[str, dict] = {}
+    for sample_id in sample_ids:
+        state = get_state(conn, sample_id)
+        assert state is not None  # 上方已确认样本存在
+        raw = {
+            "cycle_count": state["cycle_count"],
+            "cold_dose_c_min": state["cold_dose_c_min"],
+            "heat_dose_c_min": state["heat_dose_c_min"],
+            "exposure_gap_minutes": state["exposure_gap_minutes"],
+            "unacknowledged_alert_count": state["unacknowledged_alert_count"],
+        }
+        raw_metrics[sample_id] = raw
+        metrics.append(risk.RiskMetrics(**raw))
+
+    weights = risk.RiskWeights(**data["weights"])
+    items = risk.assess(sample_ids, metrics, weights)
+    return {
+        "weights": data["weights"],
+        "weight_sum": weights.total(),
+        "sample_count": len(sample_ids),
+        "items": [
+            {
+                "sample_id": item.sample_id,
+                "rank": item.rank,
+                "total_score": item.total_score,
+                "on_frontier": item.on_frontier,
+                "metrics": raw_metrics[item.sample_id],
+                "normalized": item.normalized,
+            }
+            for item in items
+        ],
     }
 
 

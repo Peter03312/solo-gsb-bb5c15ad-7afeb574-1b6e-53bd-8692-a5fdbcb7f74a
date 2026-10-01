@@ -218,3 +218,34 @@ Content-Type: application/json
   "target_volume_ul": 10,
   "target_concentration_ng_ul": 0
 }
+
+### 28. 运输风险批内比较：2～50 个已存在样本 + 五项非负权重（至少一项为正）
+###     返回原始指标、批内归一化值、加权总分、非支配前沿标记与排名（只读）
+POST {{baseUrl}}/risk-assessments
+Content-Type: application/json
+
+{
+  "sample_ids": ["sample-demo-001", "sample-mix-0", "sample-mix-50"],
+  "weights": {
+    "cycle_count": 1,
+    "cold_dose_c_min": 1,
+    "heat_dose_c_min": 2,
+    "exposure_gap_minutes": 0.5,
+    "unacknowledged_alert_count": 3
+  }
+}
+
+### 29. 权重非法（全零 / 负值 / NaN）、样本 ID 重复、数量越界、样本不存在 -> 422
+POST {{baseUrl}}/risk-assessments
+Content-Type: application/json
+
+{
+  "sample_ids": ["sample-demo-001", "sample-demo-001"],
+  "weights": {
+    "cycle_count": 1,
+    "cold_dose_c_min": 1,
+    "heat_dose_c_min": 1,
+    "exposure_gap_minutes": 1,
+    "unacknowledged_alert_count": 1
+  }
+}

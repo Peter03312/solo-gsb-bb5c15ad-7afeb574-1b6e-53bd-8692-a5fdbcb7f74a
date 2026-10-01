@@ -31,6 +31,11 @@
   的整数取用方案，按**使用来源样本数最少 → 请求顺序取用体积向量字典序最小**择优，
   逐项返回含零用量的配方与使用样本数；纯只读计算，**不扣减库存**，
   无精确解返回 409，样本不存在 / 重复 ID / 参数非法返回 422；
+- 提供**运输风险批内比较**：接收 2～50 个已存在样本 ID 与五项有限非负权重
+  （冻融循环数、低温剂量、高温剂量、暴露缺口分钟数、未确认告警数，至少一项为正），
+  从各样本当前重算状态读取五项指标，批内逐指标最小最大归一化（数值全相同记零），
+  总分为归一化值加权和除以权重和，并基于五项原始指标求**非支配前沿**；
+  返回原始指标、归一化值、总分、前沿标记与排名；纯只读计算，不改变样本状态与告警；
 - 容器启动即自动初始化数据库（建表、索引），旧版本数据库自动兼容迁移。
 
 ## 目录结构
@@ -41,10 +46,11 @@ app/
   engine.py      # 纯函数冻融状态机（循环识别 + 告警推导），不依赖 Web/DB
   matching.py    # 纯函数一致性配对（不交叉一对一最优配对），不依赖 Web/DB
   solution.py    # 纯函数配液方案求解（整数精确枚举 + 字典序择优），不依赖 Web/DB
+  risk.py        # 纯函数运输风险批内比较（归一化 + 加权总分 + 非支配前沿），不依赖 Web/DB
   database.py    # SQLite 连接与幂等建表脚本
   schemas.py     # Pydantic 请求/响应模型
-  services.py    # 业务层：幂等写入、时间重排重算、告警确认、一致性核查、配液求解
-tests/           # pytest：引擎/配对/配液单元测试 + API 集成测试
+  services.py    # 业务层：幂等写入、时间重排重算、告警确认、一致性核查、配液求解、风险评估
+tests/           # pytest：引擎/配对/配液/风险单元测试 + API 集成测试
 examples/        # requests.http / demo.sh 示例请求
 Dockerfile
 docker-compose.yml
@@ -309,6 +315,8 @@ curl http://localhost:8000/samples/sample-demo-001/alert-custody
 | GET | `/samples/{id}/state` | **当前状态**、循环次数、双向暴露剂量/缺口/预算使用率、未确认告警数、最近读数 |
 | GET | `/samples/{id}/cycles` | **完整冻融循环明细** |
 | POST | `/samples/{id}/recompute` | 手动重算 |
+| POST | `/solution-plans` | **只读配液方案**：精确枚举满足体积/质量双等式的整数取用方案（不扣减库存；无解 409，样本不存在/重复 ID/参数非法 422） |
+| POST | `/risk-assessments` | **运输风险批内比较**：2～50 个样本 + 五项非负权重，批内归一化加权评分与非支配前沿，返回原始指标/归一化值/总分/前沿标记/排名（只读） |
 | GET | `/alerts` | **告警查询**（可按样本、确认状态过滤，分页） |
 | GET/POST | `/alerts/{id}` `/alerts/{id}/ack` | 告警详情 / 确认（或取消确认） |
 | POST | `/samples/{id}/alerts/ack` | 批量确认样本下所有告警 |
@@ -524,6 +532,87 @@ curl -sS -X POST http://localhost:8000/solution-plans \
   或只存在非整数解）；
 - `422`：参数非法（类型/范围/来源个数）、来源 `sample_id` 重复、或任一来源样本不存在。
 
+## 运输风险批内比较（`POST /risk-assessments`）
+
+对一批**已存在样本**的当前运输风险做横向比较：从各样本**当前重算状态**
+（与 `GET /samples/{id}/state` 同源的状态缓存与当前未确认告警计数）读取五项
+“越低越安全”的指标，在**本批样本内**归一化后加权评分，并求非支配前沿。
+接口为**纯只读计算**：不触发重算，不修改任何样本状态、读数或告警。
+
+请求体：
+
+| 字段 | 范围 | 说明 |
+| --- | --- | --- |
+| `sample_ids` | 2～50 项 | 已存在样本 ID 列表，不可重复 |
+| `weights.cycle_count` | 有限非负 | 冻融循环数权重 |
+| `weights.cold_dose_c_min` | 有限非负 | 低温暴露剂量（°C·min）权重 |
+| `weights.heat_dose_c_min` | 有限非负 | 高温暴露剂量（°C·min）权重 |
+| `weights.exposure_gap_minutes` | 有限非负 | 暴露缺口分钟数权重 |
+| `weights.unacknowledged_alert_count` | 有限非负 | 未确认告警数权重 |
+
+五项权重**至少一项必须为正**（NaN/Inf 视为非法，全零拒绝）。
+
+计算规则：
+
+1. **批内最小最大归一化**：逐指标 `(x - min) / (max - min)`；
+   某指标批内数值全相同（`max == min`）时，该指标归一化值一律记 0；
+2. **总分** = 归一化值加权和 / 权重和（零权重指标不影响总分；
+   归一化值与总分均保留 6 位小数，总分由舍入后的归一化值计算，
+   调用方可按返回数值复算核验）；
+3. **非支配前沿**：样本 A 支配样本 B 当且仅当 A 的五项**原始指标**均不高于 B
+   且至少一项严格更低；不被批内任何其他样本支配的样本位于前沿上
+   （指标完全相同的样本互不支配，可同时在前沿上）；
+4. **排名**按总分升序、总分相同按样本 ID 升序，名次从 1 起连续编号。
+
+响应逐项返回原始指标、归一化值、总分、前沿标记与名次（按名次排列）：
+
+```bash
+curl -sS -X POST http://localhost:8000/risk-assessments \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sample_ids": ["sample-demo-001", "sample-demo-002"],
+    "weights": {
+      "cycle_count": 1,
+      "cold_dose_c_min": 1,
+      "heat_dose_c_min": 2,
+      "exposure_gap_minutes": 0.5,
+      "unacknowledged_alert_count": 3
+    }
+  }'
+```
+
+```json
+{
+  "weights": {
+    "cycle_count": 1.0,
+    "cold_dose_c_min": 1.0,
+    "heat_dose_c_min": 2.0,
+    "exposure_gap_minutes": 0.5,
+    "unacknowledged_alert_count": 3.0
+  },
+  "weight_sum": 7.5,
+  "sample_count": 2,
+  "items": [
+    {
+      "sample_id": "sample-demo-001",
+      "rank": 1,
+      "total_score": 0.0,
+      "on_frontier": true,
+      "metrics": {"cycle_count": 0, "cold_dose_c_min": 0.0, "heat_dose_c_min": 0.0,
+                  "exposure_gap_minutes": 0.0, "unacknowledged_alert_count": 0},
+      "normalized": {"cycle_count": 0.0, "cold_dose_c_min": 0.0, "heat_dose_c_min": 0.0,
+                     "exposure_gap_minutes": 0.0, "unacknowledged_alert_count": 0.0}
+    }
+  ]
+}
+```
+
+状态码：
+
+- `200`：评估完成，返回上述结果；
+- `422`：样本 ID 重复、样本数量越界（非 2～50）、权重非法（负值 / NaN / Inf /
+  全零 / 缺项）或任一样本不存在。
+
 ## 测试
 
 ```bash
@@ -551,4 +640,10 @@ pytest -q
 最少来源数优先与同级向量字典序最小（含强制多来源场景）、目标零浓度与边界体积、
 无解（浓度越界/非整数解/容量不足）返回 409、样本不存在与重复 ID 返回 422、
 整数字段严格类型与取值范围校验（1～6 个来源、目标体积 1～30、浓度 0～100）、
-只读不改写任何数据，并用暴力枚举在随机小空间上交叉验证求解器择优正确性。
+只读不改写任何数据，并用暴力枚举在随机小空间上交叉验证求解器择优正确性；
+运输风险部分覆盖最小最大归一化（含批内数值全相同记零）、加权总分与零权重忽略、
+非支配前沿（严格支配、相同向量互不支配、互不支配全在前沿）、
+排名（总分升序、总分相同按样本 ID 升序）、权重选择改变排名、
+指标与状态接口一致、确认告警后评估即时反映、只读不改写样本状态与告警、
+样本 ID 重复 / 数量越界（0、1、51 条）/ 权重非法（负值、全零、缺项、NaN/Inf）/
+样本不存在均返回 422。

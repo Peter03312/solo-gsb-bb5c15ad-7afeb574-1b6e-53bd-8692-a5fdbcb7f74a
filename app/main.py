@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import sqlite3
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from fastapi.responses import RedirectResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from . import __version__, services
 from .database import init_db
@@ -35,6 +38,8 @@ from .schemas import (
     RecomputeResponse,
     ReadingIn,
     ReadingsBatch,
+    RiskAssessmentRequest,
+    RiskAssessmentResponse,
     SampleCreate,
     SampleOut,
     SampleStateOut,
@@ -71,10 +76,37 @@ app = FastAPI(
         "目标体积/浓度，精确枚举满足体积与质量（浓度×体积）双等式的整数取用方案，"
         "按使用来源样本数最少、取用体积向量字典序最小择优；只读不扣减库存，"
         "无精确解返回 409，样本不存在、重复 ID 或参数非法返回 422。"
+        "另提供运输风险批内比较：接收 2～50 个样本 ID 与五项非负权重（至少一项为正），"
+        "从各样本当前重算状态读取冻融循环数、双向暴露剂量、暴露缺口与未确认告警数，"
+        "批内最小最大归一化后按权重求总分，并基于五项原始指标求非支配前沿，"
+        "返回原始指标、归一化值、总分、前沿标记与排名；只读，不改变样本状态与告警。"
     ),
     version=__version__,
     lifespan=lifespan,
 )
+
+
+def _json_safe(value):
+    """把非有限浮点（NaN/Inf）替换为字符串，保证错误详情可被 JSON 序列化。"""
+
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(_request, exc):
+    # 默认处理器直接 jsonable_encoder(exc.errors())：当非法输入为 NaN/Inf 时，
+    # 错误详情中的原始输入值无法被 JSONResponse（allow_nan=False）序列化，
+    # 422 会退化为 500；这里先清洗非有限浮点，保证参数非法时始终返回明确的 422。
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
+    )
 
 
 def _require_sample(conn: sqlite3.Connection, sample_id: str) -> sqlite3.Row:
@@ -690,3 +722,34 @@ def create_solution_plan(
     if result is None:
         raise HTTPException(status_code=409, detail="不存在满足目标体积与浓度的精确配液方案")
     return result
+
+
+# ---------------- 运输风险批内比较 ----------------
+
+
+@app.post(
+    "/risk-assessments",
+    response_model=RiskAssessmentResponse,
+    tags=["risk-assessments"],
+)
+def create_risk_assessment(
+    payload: RiskAssessmentRequest,
+    conn=Depends(services.get_db_connection),
+):
+    """一批已有样本的当前运输风险比较（只读）。
+
+    接收 2～50 个**已存在**样本 ID 与五项有限非负权重（冻融循环数、低温剂量、
+    高温剂量、暴露缺口分钟数、未确认告警数；至少一项为正），从各样本当前重算
+    状态读取五项指标，在本批样本内逐指标做最小最大归一化（数值全相同的指标
+    记 0），总分 = 归一化值加权和 / 权重和；并基于五项原始指标求非支配前沿
+    （A 所有指标不高于 B 且至少一项更低时 A 支配 B）。
+
+    逐项返回原始指标、归一化值、总分、前沿标记与名次（总分升序、总分相同按
+    样本 ID 升序，1 起编号）。接口为纯只读计算：不触发重算、不修改任何样本
+    状态与告警。样本 ID 重复、数量越界、权重非法或样本不存在返回 422。
+    """
+
+    try:
+        return services.assess_risk(conn, payload.model_dump())
+    except services.ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
